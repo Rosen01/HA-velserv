@@ -33,6 +33,11 @@ Thank you */
 /* Frames a client may refuse in a row before it is dropped. A healthy client
    drains its buffer immediately, so refusing this many means it is gone. */
 #define STALL_LIMIT 20
+/* A Velbus frame carries at most 8 data bytes, but the length field (byte 3,
+   low nibble) has room for 15. A larger value means the header is corrupt:
+   drop it and resync on the next 0x0F instead of waiting for -- and
+   swallowing -- up to 20 bytes that belong to the frames after it. */
+#define VELBUS_MAX_DATA 8
 
 char *devicename = MODEMDEVICE;
 char *IP_ADDRESS = IP;
@@ -225,6 +230,21 @@ void *sock_to_com(void *arg)
 				buffer[m] = recv_data[0];
 				if (m == 3)
 				{
+					if ((buffer[3] & 0x0F) > VELBUS_MAX_DATA)
+					{
+						/* Corrupt header, see VELBUS_MAX_DATA. If the
+						   rejected byte is itself 0x0F it may be the start
+						   of the real next frame, so begin one with it. */
+						bytes_in_string = 0;
+						start_recv = (buffer[3] == 0x0F);
+						if (start_recv)
+						{
+							memset(&buffer, 0, sizeof(buffer));
+							buffer[0] = 0x0F;
+							m = 1;
+						}
+						continue;
+					}
 					bytes_in_string = (buffer[3] & 0xF) + 5;
 				}
 					
@@ -293,7 +313,24 @@ void *com_to_sock(void *arg)
 
 	   // wait for data to receive from comport (blocking option)
 	   bytes_recieved = read(fd,recv_data,1);
-	
+
+	   if (bytes_recieved <= 0)
+	   {
+		   /* A signal is not a broken device; anything else is. */
+		   if (bytes_recieved < 0 && (errno == EINTR || errno == EAGAIN))
+			   continue;
+		   /* The serial device is gone (EIO after a USB hiccup or
+		      re-enumeration) or hung up (EOF). Every further read() fails
+		      the same way at once, so looping here only burns a full core
+		      while nothing reaches the bus -- 2.5 days of that, unnoticed,
+		      in 11/2026. Exit with a failure code instead: the add-on
+		      watchdog restarts velserv, which reopens the device. */
+		   fprintf(stderr, "Velserv: serial device %s %s, exiting so it can be reopened\n",
+				   devicename,
+				   bytes_recieved == 0 ? "hung up (EOF)" : strerror(errno));
+		   exit(EXIT_FAILURE);
+	   }
+
 	   if (bytes_recieved > 0)
 	   {  // if we got some data
 			if(verbose == 8)
@@ -316,6 +353,21 @@ void *com_to_sock(void *arg)
 				buffer[m] = recv_data[0];
 				if (m == 3)
 				{
+					if ((buffer[3] & 0x0F) > VELBUS_MAX_DATA)
+					{
+						/* Corrupt header, see VELBUS_MAX_DATA. If the
+						   rejected byte is itself 0x0F it may be the start
+						   of the real next frame, so begin one with it. */
+						bytes_in_string = 0;
+						start_recv = (buffer[3] == 0x0F);
+						if (start_recv)
+						{
+							memset(&buffer, 0, sizeof(buffer));
+							buffer[0] = 0x0F;
+							m = 1;
+						}
+						continue;
+					}
 					bytes_in_string = (buffer[3] & 0xF) + 5;
 				}
 					
@@ -400,7 +452,11 @@ void *server(void *arg)
 	int yes = 1;
 	socklen_t addrlen;
 	int i, j;
-	char *ip_add_arr[100] = {0};
+	/* Peer address per socket, for log lines only. A fixed buffer per fd
+	   instead of a malloc per connection: the malloc was freed only on a clean
+	   hang-up with verbose > 3, so every connection leaked at the default
+	   level, and the old 100-slot array overflowed at socket number 100. */
+	static char ip_add_arr[FD_SETSIZE][INET_ADDRSTRLEN];
 
 	int pointer,bytes_in_string;
 	//unsigned char message[8];
@@ -554,11 +610,10 @@ void *server(void *arg)
 						{
 							fprintf(stdout,"Velserv: new connection from %s on socket %d\n", inet_ntoa(clientaddr.sin_addr), newfd);
 						}
-						char *ip_add = inet_ntoa(clientaddr.sin_addr);
-						ip_add_arr[newfd]=malloc(strlen(ip_add)+1);
-						strcpy(ip_add_arr[newfd],ip_add);
 						if (newfd < FD_SETSIZE)
 						{
+							snprintf(ip_add_arr[newfd], sizeof(ip_add_arr[newfd]), "%s",
+							         inet_ntoa(clientaddr.sin_addr));
 							fraglen[newfd] = 0;   /* start with an empty reassembly buffer */
 							stalled[newfd] = 0;
 						}
@@ -576,7 +631,8 @@ void *server(void *arg)
 						{
 							if (verbose>3)
 							{
-								fprintf(stdout,"Velserv: %s on socket %d hung up\n",ip_add_arr[i], i);
+								fprintf(stdout,"Velserv: %s on socket %d hung up\n",
+								        i < FD_SETSIZE ? ip_add_arr[i] : "?", i);
 							}
 						}
 						else
@@ -629,6 +685,11 @@ void *server(void *arg)
 								continue;
 							}
 
+							if ((work[pointer+3] & 0x0F) > VELBUS_MAX_DATA)
+							{
+								pointer++;   /* corrupt header, see VELBUS_MAX_DATA: resync */
+								continue;
+							}
 							bytes_in_string = (work[pointer+3] & 0x0F) + 6;
 
 							/* whole frame not received yet -> wait for the next recv() */
@@ -725,10 +786,6 @@ void *server(void *arg)
 				}
 			}
 		}
-	}
-	for (i = 0; i < (int)(sizeof(ip_add_arr) / sizeof(ip_add_arr[0])); i++)
-	{
-		free(ip_add_arr[i]);
 	}
 }
 
